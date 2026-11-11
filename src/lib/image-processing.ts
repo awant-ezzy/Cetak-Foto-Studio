@@ -56,6 +56,50 @@ export const DEFAULT_ENHANCE: EnhanceParams = {
   sharpen: 50,
 };
 
+/**
+ * Background removal / color replacement params.
+ * Algoritma: deteksi warna background (auto dari pojok atau manual),
+ * lalu ganti semua pixel yang berada dalam threshold warna tersebut
+ * dengan warna target, dengan feathering edge untuk hasil halus.
+ */
+export interface BackgroundRemovalParams {
+  enabled: boolean;
+  /** mode deteksi warna background */
+  sourceMode: "auto" | "pick";
+  /** warna background source (RGB 0-255). Jika null, dihitung dari pojok. */
+  sourceColor: { r: number; g: number; b: number } | null;
+  /** threshold 0..100 (semakin tinggi, semakin banyak pixel dianggap bg) */
+  threshold: number;
+  /** warna target pengganti (hex, mis. #ffffff) */
+  targetColor: string;
+  /** feather edge 0..100 (anti-jagged) */
+  feather: number;
+  /** tolerance untuk flood-fill pixel yang masih bg */
+  floodFill: boolean;
+}
+
+export const DEFAULT_BG_REMOVAL: BackgroundRemovalParams = {
+  enabled: false,
+  sourceMode: "auto",
+  sourceColor: null,
+  threshold: 35,
+  targetColor: "#ffffff",
+  feather: 30,
+  floodFill: true,
+};
+
+/** Preset warna background umum untuk pas foto Indonesia */
+export const BG_PRESETS: Array<{ id: string; label: string; hex: string }> = [
+  { id: "white", label: "Putih", hex: "#ffffff" },
+  { id: "red", label: "Merah", hex: "#d11b1b" },
+  { id: "blue", label: "Biru", hex: "#1d4ed8" },
+  { id: "lightblue", label: "Biru Muda", hex: "#7dd3fc" },
+  { id: "gray", label: "Abu", hex: "#9ca3af" },
+  { id: "green", label: "Hijau", hex: "#16a34a" },
+  { id: "yellow", label: "Kuning", hex: "#fde047" },
+  { id: "transparent", label: "Transparan", hex: "transparent" },
+];
+
 /** Muat gambar dari File menjadi HTMLImageElement */
 export function loadImageFromFile(file: File): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -85,7 +129,7 @@ export function loadImageFromSrc(src: string): Promise<HTMLImageElement> {
 }
 
 /**
- * Apply adjustment + beauty ke source canvas.
+ * Apply adjustment + beauty + bg removal ke source canvas.
  * Mengembalikan canvas baru (atau in-place).
  */
 export function applyAdjustments(
@@ -93,6 +137,7 @@ export function applyAdjustments(
   adjustment: AdjustmentParams,
   beauty: BeautyParams = DEFAULT_BEAUTY,
   enhance: EnhanceParams = DEFAULT_ENHANCE,
+  bgRemoval: BackgroundRemovalParams = DEFAULT_BG_REMOVAL,
 ): HTMLCanvasElement {
   // Tentukan dimensi output (resolusi asli atau di-upscale untuk HD)
   const srcW =
@@ -130,12 +175,17 @@ export function applyAdjustments(
     applyBeautyRetouch(canvasA, beauty);
   }
 
-  // Step 4: apply HD sharpen (unsharp mask sederhana)
+  // Step 4: apply background removal / color replacement
+  if (bgRemoval.enabled) {
+    removeBackground(canvasA, bgRemoval);
+  }
+
+  // Step 5: apply HD sharpen (unsharp mask sederhana)
   if (enhance.enabled && enhance.sharpen > 0) {
     applySharpen(canvasA, enhance.sharpen / 100);
   }
 
-  // Step 5: rotation & mirror
+  // Step 6: rotation & mirror
   const canvasB = document.createElement("canvas");
   canvasB.width = finalW;
   canvasB.height = finalH;
@@ -518,4 +568,273 @@ export function resizeContain(
   targetH: number,
 ): HTMLCanvasElement {
   return fitContain(source, targetW, targetH, "rgba(0,0,0,0)");
+}
+
+// =============================================================
+// BACKGROUND REMOVAL / COLOR REPLACEMENT
+// =============================================================
+
+/** Hex → RGB. Mendukung #rgb, #rrggbb, transparent */
+export function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
+  if (!hex || hex === "transparent") return null;
+  let h = hex.replace("#", "");
+  if (h.length === 3) {
+    h = h
+      .split("")
+      .map((c) => c + c)
+      .join("");
+  }
+  if (h.length !== 6) return null;
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return null;
+  return { r, g, b };
+}
+
+/** RGB → Hex */
+export function rgbToHex(r: number, g: number, b: number): string {
+  const toHex = (v: number) =>
+    Math.max(0, Math.min(255, Math.round(v)))
+      .toString(16)
+      .padStart(2, "0");
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+/**
+ * Sample warna background dari 4 pojok gambar + rata-rata.
+ * Mengembalikan rata-rata RGB.
+ */
+export function detectBackgroundColor(
+  canvas: HTMLCanvasElement,
+): { r: number; g: number; b: number } {
+  const ctx = canvas.getContext("2d")!;
+  const w = canvas.width;
+  const h = canvas.height;
+  const sampleSize = Math.max(5, Math.round(Math.min(w, h) * 0.05));
+  const samples: Array<{ r: number; g: number; b: number }> = [];
+
+  // Sample dari 4 pojok
+  const corners = [
+    [0, 0],
+    [w - sampleSize, 0],
+    [0, h - sampleSize],
+    [w - sampleSize, h - sampleSize],
+  ];
+  for (const [cx, cy] of corners) {
+    try {
+      const data = ctx.getImageData(cx, cy, sampleSize, sampleSize).data;
+      let rSum = 0,
+        gSum = 0,
+        bSum = 0,
+        count = 0;
+      // sample tiap 4 pixel untuk performa
+      for (let i = 0; i < data.length; i += 16) {
+        rSum += data[i];
+        gSum += data[i + 1];
+        bSum += data[i + 2];
+        count++;
+      }
+      if (count > 0) {
+        samples.push({
+          r: rSum / count,
+          g: gSum / count,
+          b: bSum / count,
+        });
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (samples.length === 0) return { r: 255, g: 255, b: 255 };
+
+  // Median (lebih robust terhadap outlier) per channel
+  const rArr = samples.map((s) => s.r).sort((a, b) => a - b);
+  const gArr = samples.map((s) => s.g).sort((a, b) => a - b);
+  const bArr = samples.map((s) => s.b).sort((a, b) => a - b);
+  const mid = Math.floor(samples.length / 2);
+  return {
+    r: rArr[mid],
+    g: gArr[mid],
+    b: bArr[mid],
+  };
+}
+
+/**
+ * Hitung jarak warna (Euclidean di RGB, dinormalisasi 0..441).
+ * 0 = sama persis, 441 = jarak maksimal (hitam vs putih).
+ */
+function colorDistance(
+  r1: number,
+  g1: number,
+  b1: number,
+  r2: number,
+  g2: number,
+  b2: number,
+): number {
+  const dr = r1 - r2;
+  const dg = g1 - g2;
+  const db = b1 - b2;
+  return Math.sqrt((dr * dr + dg * dg + db * db) / 3);
+}
+
+/**
+ * Remove / replace background.
+ * - Deteksi warna background dari pojok (auto) atau pakai sourceColor.
+ * - Pixel dalam threshold akan diganti dengan warna target.
+ * - Flood-fill opsional untuk hasil lebih bersih (hanya ganti area bg yang connected ke pojok).
+ * - Feather edge untuk anti-jagged.
+ */
+export function removeBackground(
+  canvas: HTMLCanvasElement,
+  params: BackgroundRemovalParams,
+): void {
+  if (!params.enabled) return;
+  const ctx = canvas.getContext("2d")!;
+  const w = canvas.width;
+  const h = canvas.height;
+  if (w === 0 || h === 0) return;
+
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+
+  // Tentukan warna source
+  let srcColor = params.sourceColor;
+  if (!srcColor || params.sourceMode === "auto") {
+    srcColor = detectBackgroundColor(canvas);
+  }
+  const { r: sr, g: sg, b: sb } = srcColor;
+
+  // Threshold: 0..100 → distance 0..100 (sqrt dari max distance 441)
+  // threshold 35 → distance ~35 (cukup longgar untuk bg solid)
+  const threshold = (params.threshold / 100) * 100;
+  const featherRange = (params.feather / 100) * 50; // feather seluas 0..50 distance
+
+  // Tentukan warna target
+  const transparent = params.targetColor === "transparent";
+  const targetRgb = transparent ? null : hexToRgb(params.targetColor);
+
+  // Mask: 0 = full fg (keep), 1 = full bg (replace), 0..1 = feathered
+  const mask = new Float32Array(w * h);
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = (y * w + x) * 4;
+      const r = data[idx];
+      const g = data[idx + 1];
+      const b = data[idx + 2];
+      const dist = colorDistance(r, g, b, sr, sg, sb);
+      // dist <= threshold → bg; dist >= threshold + feather → fg
+      let m: number;
+      if (dist <= threshold) {
+        m = 1; // full bg
+      } else if (dist < threshold + featherRange) {
+        // feather: 1 → 0
+        m = 1 - (dist - threshold) / featherRange;
+      } else {
+        m = 0; // full fg
+      }
+      mask[y * w + x] = m;
+    }
+  }
+
+  // Optional flood-fill: hanya pertahankan bg yang connected ke pojok.
+  // Ini mencegah area fg dengan warna mirip bg (mis. baju putih) ikut ter-replace.
+  if (params.floodFill) {
+    const visited = new Uint8Array(w * h);
+    const queue: number[] = [];
+    // Seed dari 4 pojok
+    const seeds = [0, w - 1, (h - 1) * w, h * w - 1];
+    for (const s of seeds) {
+      if (mask[s] > 0.5 && !visited[s]) {
+        queue.push(s);
+        visited[s] = 1;
+      }
+    }
+    // BFS
+    while (queue.length > 0) {
+      const p = queue.shift()!;
+      const px = p % w;
+      const py = Math.floor(p / w);
+      const neighbors = [
+        px > 0 ? p - 1 : -1,
+        px < w - 1 ? p + 1 : -1,
+        py > 0 ? p - w : -1,
+        py < h - 1 ? p + w : -1,
+      ];
+      for (const n of neighbors) {
+        if (n < 0 || visited[n]) continue;
+        visited[n] = 1;
+        // Jika pixel ini adalah bg (mask > 0.1), lanjutkan BFS
+        if (mask[n] > 0.1) {
+          queue.push(n);
+        } else {
+          // pixel fg yang adjacent ke bg → tandai sebagai edge (dipertahankan)
+        }
+      }
+    }
+    // Reset mask untuk pixel yang tidak terjangkau flood fill (dan bukan edge)
+    for (let i = 0; i < mask.length; i++) {
+      if (!visited[i]) {
+        // Pixel tidak terhubung ke bg → kemungkinan fg dengan warna mirip bg
+        // Hanya zero-out jika mask > 0 (bg) dan tidak adjacent ke visited
+        // Untuk simplicity: kurangi mask secara agresif
+        mask[i] = Math.min(mask[i], 0);
+      }
+    }
+  }
+
+  // Apply mask: blend target color dengan alpha = mask
+  for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+    const m = mask[j];
+    if (m <= 0) continue; // full fg, skip
+    if (m >= 1) {
+      // full bg → replace
+      if (transparent) {
+        data[i + 3] = 0; // transparent
+      } else if (targetRgb) {
+        data[i] = targetRgb.r;
+        data[i + 1] = targetRgb.g;
+        data[i + 2] = targetRgb.b;
+        data[i + 3] = 255;
+      }
+    } else {
+      // feathered → blend
+      if (transparent) {
+        data[i + 3] = Math.round((1 - m) * 255);
+      } else if (targetRgb) {
+        data[i] = data[i] * (1 - m) + targetRgb.r * m;
+        data[i + 1] = data[i + 1] * (1 - m) + targetRgb.g * m;
+        data[i + 2] = data[i + 2] * (1 - m) + targetRgb.b * m;
+        data[i + 3] = 255;
+      }
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+}
+
+/**
+ * Pick warna pixel pada posisi (x, y) di canvas.
+ */
+export function pickColorAt(
+  canvas: HTMLCanvasElement,
+  x: number,
+  y: number,
+): { r: number; g: number; b: number } {
+  const ctx = canvas.getContext("2d")!;
+  // Sample 3x3 area untuk stabilisasi
+  const data = ctx.getImageData(Math.max(0, x - 1), Math.max(0, y - 1), 3, 3).data;
+  let r = 0,
+    g = 0,
+    b = 0,
+    count = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    r += data[i];
+    g += data[i + 1];
+    b += data[i + 2];
+    count++;
+  }
+  return { r: r / count, g: g / count, b: b / count };
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Upload, Trash2, Download, Printer, Image as ImageIcon, RotateCw, X } from "lucide-react";
+import { Upload, Trash2, Download, Printer, Image as ImageIcon, RotateCw, X, Plus, Ruler } from "lucide-react";
 import { UploadZone } from "@/components/upload/upload-zone";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -21,8 +21,30 @@ import {
   ToggleGroupItem,
 } from "@/components/ui/toggle-group";
 import { Badge } from "@/components/ui/badge";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { toast } from "sonner";
-import { PHOTO_SIZES, getPhotoSize, PAS_PHOTO_SIZES, R_PHOTO_SIZES } from "@/lib/photo-sizes";
+import {
+  PHOTO_SIZES,
+  getPhotoSize,
+  PAS_PHOTO_SIZES,
+  R_PHOTO_SIZES,
+  type PhotoSize,
+  type CustomPhotoTemplate,
+  type SizeUnit,
+  createCustomTemplate,
+  customTemplateToPhotoSize,
+  loadCustomTemplates,
+  saveCustomTemplates,
+  TEMPLATE_PRESETS,
+  UNIT_TO_MM,
+} from "@/lib/photo-sizes";
 import {
   PAPER_SIZES,
   getPaperSize,
@@ -61,9 +83,68 @@ export function PhotoPrinter({ initialPhotos }: PhotoPrinterProps) {
   const [printLoading, setPrintLoading] = useState(false);
   const [pdfLoading, setPdfLoading] = useState(false);
 
+  // Custom templates state
+  const [customTemplates, setCustomTemplates] = useState<CustomPhotoTemplate[]>([]);
+  const [showTemplateDialog, setShowTemplateDialog] = useState(false);
+  // form state for new template
+  const [tplName, setTplName] = useState("");
+  const [tplWidth, setTplWidth] = useState("35");
+  const [tplHeight, setTplHeight] = useState("45");
+  const [tplUnit, setTplUnit] = useState<SizeUnit>("mm");
+
+  // Load custom templates on mount
+  useEffect(() => {
+    setCustomTemplates(loadCustomTemplates());
+  }, []);
+
+  // Persist custom templates whenever they change
+  useEffect(() => {
+    saveCustomTemplates(customTemplates);
+  }, [customTemplates]);
+
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Handle file upload
+  const handleAddTemplate = () => {
+    const w = parseFloat(tplWidth);
+    const h = parseFloat(tplHeight);
+    if (Number.isNaN(w) || Number.isNaN(h) || w <= 0 || h <= 0) {
+      toast.error("Ukuran tidak valid", {
+        description: "Lebar dan tinggi harus angka positif.",
+      });
+      return;
+    }
+    if (w > 1000 || h > 1000) {
+      toast.error("Ukuran terlalu besar", {
+        description: "Maksimal 1000 unit (mm/cm/inci).",
+      });
+      return;
+    }
+    const tpl = createCustomTemplate(tplName, w, h, tplUnit);
+    setCustomTemplates((prev) => [...prev, tpl]);
+    setPhotoSizeId(tpl.id);
+    setShowTemplateDialog(false);
+    setTplName("");
+    setTplWidth("35");
+    setTplHeight("45");
+    setTplUnit("mm");
+    toast.success(`Template "${tpl.name}" dibuat`, {
+      description: `${w}×${h} ${tplUnit} = ${tpl.widthMm}×${tpl.heightMm} mm`,
+    });
+  };
+
+  const handleDeleteTemplate = (id: string) => {
+    setCustomTemplates((prev) => prev.filter((t) => t.id !== id));
+    if (photoSizeId === id) setPhotoSizeId("3x4");
+    toast.success("Template dihapus");
+  };
+
+  const handleApplyPreset = (preset: (typeof TEMPLATE_PRESETS)[number]) => {
+    setTplName(preset.name);
+    setTplWidth(String(preset.widthValue));
+    setTplHeight(String(preset.heightValue));
+    setTplUnit(preset.unit);
+  };
+
   const handleFiles = useCallback((files: File[]) => {
     const valid = files.filter((f) => f.type.startsWith("image/"));
     if (valid.length === 0) {
@@ -96,7 +177,15 @@ export function PhotoPrinter({ initialPhotos }: PhotoPrinterProps) {
 
   // Compute layout
   const paper = getPaperSize(paperId)!;
-  const photoSize = getPhotoSize(photoSizeId)!;
+  // Cari photoSize dari standar atau custom templates
+  const photoSize: PhotoSize = useMemo(() => {
+    const std = getPhotoSize(photoSizeId);
+    if (std) return std;
+    const custom = customTemplates.find((t) => t.id === photoSizeId);
+    if (custom) return customTemplateToPhotoSize(custom);
+    // fallback ke 3x4
+    return getPhotoSize("3x4")!;
+  }, [photoSizeId, customTemplates]);
 
   const layout = useMemo(
     () =>
@@ -462,6 +551,172 @@ export function PhotoPrinter({ initialPhotos }: PhotoPrinterProps) {
                   </button>
                 ))}
               </div>
+            </div>
+
+            {/* Custom Template (Ukuran Bebas) */}
+            <div className="space-y-2 p-3 rounded-lg bg-neon-cyan/5 border border-neon-cyan/30">
+              <div className="flex items-center justify-between">
+                <Label className="text-xs flex items-center gap-1">
+                  <Ruler className="h-3 w-3 text-neon-cyan" />
+                  Template Custom (Ukuran Bebas)
+                </Label>
+                <Dialog open={showTemplateDialog} onOpenChange={setShowTemplateDialog}>
+                  <DialogTrigger asChild>
+                    <Button
+                      size="sm"
+                      className="h-7 text-xs bg-neon-cyan text-background hover:bg-neon-cyan/90"
+                    >
+                      <Plus className="h-3 w-3 mr-1" />
+                      Buat
+                    </Button>
+                  </DialogTrigger>
+                  <DialogContent className="max-w-md bg-card border-border">
+                    <DialogHeader>
+                      <DialogTitle className="flex items-center gap-2">
+                        <Ruler className="h-4 w-4 text-neon-cyan" />
+                        Buat Template Baru
+                      </DialogTitle>
+                    </DialogHeader>
+                    <div className="space-y-3 py-2">
+                      {/* Quick presets */}
+                      <div className="space-y-1.5">
+                        <Label className="text-xs">Preset Cepat</Label>
+                        <div className="flex flex-wrap gap-1.5 max-h-32 overflow-y-auto scrollbar-studio p-1">
+                          {TEMPLATE_PRESETS.map((p) => (
+                            <button
+                              key={p.name}
+                              onClick={() => handleApplyPreset(p)}
+                              className="px-2 py-1 rounded text-[10px] bg-secondary/40 border border-border hover:border-neon-cyan/50 text-left"
+                              title={p.note}
+                            >
+                              <div className="font-medium">{p.name}</div>
+                              <div className="text-muted-foreground">
+                                {p.widthValue}×{p.heightValue} {p.unit}
+                              </div>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <Label className="text-xs" htmlFor="tpl-name">
+                          Nama Template
+                        </Label>
+                        <Input
+                          id="tpl-name"
+                          value={tplName}
+                          onChange={(e) => setTplName(e.target.value)}
+                          placeholder="mis. Paspor Custom 35×45"
+                          className="h-9"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-3 gap-2">
+                        <div className="space-y-1.5">
+                          <Label className="text-xs" htmlFor="tpl-w">Lebar</Label>
+                          <Input
+                            id="tpl-w"
+                            type="number"
+                            value={tplWidth}
+                            onChange={(e) => setTplWidth(e.target.value)}
+                            className="h-9"
+                            step="0.1"
+                            min="0.1"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <Label className="text-xs" htmlFor="tpl-h">Tinggi</Label>
+                          <Input
+                            id="tpl-h"
+                            type="number"
+                            value={tplHeight}
+                            onChange={(e) => setTplHeight(e.target.value)}
+                            className="h-9"
+                            step="0.1"
+                            min="0.1"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <Label className="text-xs">Satuan</Label>
+                          <Select value={tplUnit} onValueChange={(v) => setTplUnit(v as SizeUnit)}>
+                            <SelectTrigger className="h-9">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="mm">mm</SelectItem>
+                              <SelectItem value="cm">cm</SelectItem>
+                              <SelectItem value="inch">inci</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      </div>
+
+                      {/* Preview konversi */}
+                      <div className="text-[11px] text-muted-foreground p-2 rounded bg-secondary/30 border border-border/60">
+                        <div className="flex items-center justify-between">
+                          <span>Konversi ke mm:</span>
+                          <span className="font-mono text-neon-cyan">
+                            {(parseFloat(tplWidth || "0") * UNIT_TO_MM[tplUnit]).toFixed(1)} × {(parseFloat(tplHeight || "0") * UNIT_TO_MM[tplUnit]).toFixed(1)} mm
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                    <DialogFooter>
+                      <Button
+                        variant="outline"
+                        onClick={() => setShowTemplateDialog(false)}
+                        className="h-9"
+                      >
+                        Batal
+                      </Button>
+                      <Button
+                        onClick={handleAddTemplate}
+                        className="h-9 bg-neon-cyan text-background hover:bg-neon-cyan/90"
+                      >
+                        <Plus className="h-4 w-4 mr-1" />
+                        Simpan Template
+                      </Button>
+                    </DialogFooter>
+                  </DialogContent>
+                </Dialog>
+              </div>
+
+              {customTemplates.length === 0 ? (
+                <p className="text-[10px] text-muted-foreground px-1">
+                  Belum ada template custom. Klik <strong className="text-neon-cyan">Buat</strong> untuk membuat ukuran bebas (mis. Paspor 35×45mm, ID Card, dll).
+                </p>
+              ) : (
+                <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto scrollbar-studio p-1">
+                  {customTemplates.map((t) => (
+                    <div
+                      key={t.id}
+                      className={`group relative inline-flex items-center gap-1 pl-2.5 pr-6 py-1.5 rounded-md text-xs font-medium border transition-all ${
+                        photoSizeId === t.id
+                          ? "bg-neon-cyan/20 border-neon-cyan text-neon-cyan glow-cyan"
+                          : "bg-secondary/40 border-border hover:border-neon-cyan/50"
+                      }`}
+                    >
+                      <button
+                        onClick={() => setPhotoSizeId(t.id)}
+                        className="text-left"
+                        title={`${t.name} — ${t.widthMm}×${t.heightMm} mm`}
+                      >
+                        {t.name}
+                        <span className="ml-1 text-[10px] text-muted-foreground">
+                          {t.widthValue}×{t.heightValue} {t.unit}
+                        </span>
+                      </button>
+                      <button
+                        onClick={() => handleDeleteTemplate(t.id)}
+                        className="absolute right-0.5 top-1/2 -translate-y-1/2 h-5 w-5 rounded bg-black/30 hover:bg-destructive flex items-center justify-center text-white opacity-0 group-hover:opacity-100 transition-opacity"
+                        aria-label="Hapus template"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Repeat mode */}

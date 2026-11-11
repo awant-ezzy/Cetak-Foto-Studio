@@ -17,6 +17,11 @@ import {
   Heart,
   Image as ImageIcon,
   RotateCcw,
+  Eraser,
+  Pipette,
+  Palette,
+  Square,
+  Wand,
 } from "lucide-react";
 import { UploadZone } from "@/components/upload/upload-zone";
 import { Button } from "@/components/ui/button";
@@ -32,12 +37,19 @@ import {
   loadImageFromFile,
   canvasToJpeg,
   canvasToPng,
+  detectBackgroundColor,
+  pickColorAt,
+  rgbToHex,
+  hexToRgb,
   type AdjustmentParams,
   type BeautyParams,
   type EnhanceParams,
+  type BackgroundRemovalParams,
   DEFAULT_ADJUSTMENT,
   DEFAULT_BEAUTY,
   DEFAULT_ENHANCE,
+  DEFAULT_BG_REMOVAL,
+  BG_PRESETS,
 } from "@/lib/image-processing";
 
 interface EditedPhoto {
@@ -92,8 +104,11 @@ export function PhotoEditor() {
   const [adjustment, setAdjustment] = useState<AdjustmentParams>(DEFAULT_ADJUSTMENT);
   const [beauty, setBeauty] = useState<BeautyParams>(DEFAULT_BEAUTY);
   const [enhance, setEnhance] = useState<EnhanceParams>(DEFAULT_ENHANCE);
+  const [bgRemoval, setBgRemoval] = useState<BackgroundRemovalParams>(DEFAULT_BG_REMOVAL);
   const [processing, setProcessing] = useState(false);
   const [activePreset, setActivePreset] = useState("none");
+  const [pickingSource, setPickingSource] = useState(false);
+  const [detectedColorHex, setDetectedColorHex] = useState<string | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -117,6 +132,9 @@ export function PhotoEditor() {
     setAdjustment(DEFAULT_ADJUSTMENT);
     setBeauty(DEFAULT_BEAUTY);
     setEnhance(DEFAULT_ENHANCE);
+    setBgRemoval(DEFAULT_BG_REMOVAL);
+    setDetectedColorHex(null);
+    setPickingSource(false);
     setActivePreset("none");
     toast.success("Foto dimuat");
 
@@ -144,6 +162,9 @@ export function PhotoEditor() {
     setAdjustment(DEFAULT_ADJUSTMENT);
     setBeauty(DEFAULT_BEAUTY);
     setEnhance(DEFAULT_ENHANCE);
+    setBgRemoval(DEFAULT_BG_REMOVAL);
+    setDetectedColorHex(null);
+    setPickingSource(false);
     setActivePreset("none");
   };
 
@@ -155,7 +176,7 @@ export function PhotoEditor() {
     const run = () => {
       setProcessing(true);
       try {
-        const result = applyAdjustments(source, adjustment, beauty, enhance);
+        const result = applyAdjustments(source, adjustment, beauty, enhance, bgRemoval);
         const canvas = canvasRef.current;
         if (canvas) {
           canvas.width = result.width;
@@ -171,7 +192,7 @@ export function PhotoEditor() {
     };
     raf = requestAnimationFrame(run);
     return () => cancelAnimationFrame(raf);
-  }, [photo, adjustment, beauty, enhance]);
+  }, [photo, adjustment, beauty, enhance, bgRemoval]);
 
   const applyPreset = (preset: PresetAdjustment) => {
     setActivePreset(preset.id);
@@ -182,8 +203,41 @@ export function PhotoEditor() {
     setAdjustment(DEFAULT_ADJUSTMENT);
     setBeauty(DEFAULT_BEAUTY);
     setEnhance(DEFAULT_ENHANCE);
+    setBgRemoval(DEFAULT_BG_REMOVAL);
+    setDetectedColorHex(null);
     setActivePreset("none");
     toast.success("Reset ke original");
+  };
+
+  // Auto-detect background color dari source canvas
+  const handleDetectBg = () => {
+    if (!sourceCanvasRef.current) return;
+    const color = detectBackgroundColor(sourceCanvasRef.current);
+    const hex = rgbToHex(color.r, color.g, color.b);
+    setBgRemoval((p) => ({ ...p, sourceColor: color, sourceMode: "pick" }));
+    setDetectedColorHex(hex);
+    toast.success(`Warna background terdeteksi: ${hex}`, {
+      description: `RGB(${Math.round(color.r)}, ${Math.round(color.g)}, ${Math.round(color.b)})`,
+    });
+  };
+
+  // Click di canvas untuk pick warna source
+  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!pickingSource || !canvasRef.current) return;
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const x = Math.round((e.clientX - rect.left) * scaleX);
+    const y = Math.round((e.clientY - rect.top) * scaleY);
+    const color = pickColorAt(canvas, x, y);
+    const hex = rgbToHex(color.r, color.g, color.b);
+    setBgRemoval((p) => ({ ...p, sourceColor: color, sourceMode: "pick" }));
+    setDetectedColorHex(hex);
+    setPickingSource(false);
+    toast.success(`Warna dipilih: ${hex}`, {
+      description: `Klik di area background yang ingin dihilangkan`,
+    });
   };
 
   const handleDownload = (format: "jpeg" | "png") => {
@@ -243,6 +297,16 @@ export function PhotoEditor() {
                       HD → {enhance.targetWidth}px
                     </Badge>
                   )}
+                  {bgRemoval.enabled && (
+                    <Badge
+                      variant="outline"
+                      className="text-[10px] text-neon-magenta border-neon-magenta/40"
+                    >
+                      BG: {bgRemoval.targetColor === "transparent"
+                        ? "Transparan"
+                        : bgRemoval.targetColor}
+                    </Badge>
+                  )}
                   {processing && (
                     <Badge variant="outline" className="text-[10px] text-neon-lime border-neon-lime/40 animate-pulse">
                       Memproses...
@@ -276,8 +340,10 @@ export function PhotoEditor() {
                       maxWidth: "100%",
                       maxHeight: "100%",
                       display: "block",
+                      cursor: pickingSource ? "crosshair" : "default",
                     }}
                     className="object-contain"
+                    onClick={handleCanvasClick}
                   />
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -364,12 +430,15 @@ export function PhotoEditor() {
           </Card>
 
           <Tabs defaultValue="basic" className="w-full">
-            <TabsList className="grid w-full grid-cols-3 bg-card/60 border border-border/60">
+            <TabsList className="grid w-full grid-cols-4 bg-card/60 border border-border/60">
               <TabsTrigger value="basic" className="text-xs">
                 <Sun className="h-3 w-3 mr-1" /> Basic
               </TabsTrigger>
               <TabsTrigger value="beauty" className="text-xs">
                 <Heart className="h-3 w-3 mr-1" /> Beauty
+              </TabsTrigger>
+              <TabsTrigger value="bg" className="text-xs">
+                <Eraser className="h-3 w-3 mr-1" /> Background
               </TabsTrigger>
               <TabsTrigger value="hd" className="text-xs">
                 <Zap className="h-3 w-3 mr-1" /> HD
@@ -519,6 +588,231 @@ export function PhotoEditor() {
                       Aktifkan Beauty Retouch untuk smooth & brighten otomatis
                       pada area wajah
                     </p>
+                  )}
+                </CardContent>
+              </Card>
+            </TabsContent>
+
+            {/* Background Removal / Color Replacement */}
+            <TabsContent value="bg" className="mt-3">
+              <Card className="bg-card/60 border-border/60">
+                <CardContent className="py-4 space-y-3">
+                  <div className="flex items-center justify-between gap-2 p-3 rounded-lg bg-secondary/30 border border-border/60">
+                    <div className="flex flex-col">
+                      <Label className="text-xs font-medium flex items-center gap-1">
+                        <Eraser className="h-3 w-3 text-neon-magenta" /> Hapus/Ganti Background
+                      </Label>
+                      <span className="text-[10px] text-muted-foreground">
+                        Hilangkan background atau ganti warna untuk pas foto
+                      </span>
+                    </div>
+                    <Switch
+                      checked={bgRemoval.enabled}
+                      onCheckedChange={(v) =>
+                        setBgRemoval((p) => ({ ...p, enabled: v }))
+                      }
+                    />
+                  </div>
+
+                  {/* Source color detection */}
+                  <div className="space-y-2">
+                    <Label className="text-xs flex items-center gap-1">
+                      <Pipette className="h-3 w-3" /> Warna Background Asli
+                    </Label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button
+                        variant={bgRemoval.sourceMode === "auto" ? "default" : "outline"}
+                        size="sm"
+                        disabled={!bgRemoval.enabled}
+                        onClick={() =>
+                          setBgRemoval((p) => ({
+                            ...p,
+                            sourceMode: "auto",
+                            sourceColor: null,
+                          }))
+                        }
+                        className="text-xs h-8"
+                      >
+                        <Wand className="h-3 w-3 mr-1" />
+                        Auto (pojok)
+                      </Button>
+                      <Button
+                        variant={pickingSource ? "default" : "outline"}
+                        size="sm"
+                        disabled={!bgRemoval.enabled}
+                        onClick={() => setPickingSource((p) => !p)}
+                        className="text-xs h-8"
+                      >
+                        <Pipette className="h-3 w-3 mr-1" />
+                        {pickingSource ? "Klik di gambar..." : "Pilih manual"}
+                      </Button>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={!bgRemoval.enabled}
+                      onClick={handleDetectBg}
+                      className="w-full text-xs h-8"
+                    >
+                      <Wand className="h-3 w-3 mr-1" />
+                      Deteksi ulang dari pojok
+                    </Button>
+                    {detectedColorHex && bgRemoval.sourceColor && (
+                      <div className="flex items-center gap-2 p-2 rounded bg-secondary/30 border border-border/60">
+                        <div
+                          className="h-7 w-7 rounded border border-border"
+                          style={{
+                            backgroundColor: detectedColorHex,
+                            backgroundImage:
+                              detectedColorHex === "transparent"
+                                ? "linear-gradient(45deg,#666 25%,transparent 25%),linear-gradient(-45deg,#666 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#666 75%),linear-gradient(-45deg,transparent 75%,#666 75%)"
+                                : undefined,
+                            backgroundSize: detectedColorHex === "transparent" ? "8px 8px" : undefined,
+                          }}
+                        />
+                        <div className="text-xs flex-1">
+                          <div className="text-muted-foreground">Terdeteksi:</div>
+                          <div className="font-mono text-neon-cyan">
+                            {detectedColorHex}
+                          </div>
+                        </div>
+                        <div className="text-[10px] text-muted-foreground text-right">
+                          RGB({Math.round(bgRemoval.sourceColor.r)},{" "}
+                          {Math.round(bgRemoval.sourceColor.g)},{" "}
+                          {Math.round(bgRemoval.sourceColor.b)})
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Target color picker */}
+                  <div className="space-y-2 border-t border-border/60 pt-3">
+                    <Label className="text-xs flex items-center gap-1">
+                      <Palette className="h-3 w-3" /> Warna Pengganti
+                    </Label>
+                    <div className="grid grid-cols-4 gap-1.5">
+                      {BG_PRESETS.map((preset) => (
+                        <button
+                          key={preset.id}
+                          disabled={!bgRemoval.enabled}
+                          onClick={() =>
+                            setBgRemoval((p) => ({
+                              ...p,
+                              targetColor: preset.hex,
+                            }))
+                          }
+                          className={`relative h-9 rounded-md border text-[10px] font-medium flex items-center justify-center transition-all ${
+                            bgRemoval.targetColor === preset.hex
+                              ? "border-neon-cyan glow-cyan text-foreground"
+                              : "border-border hover:border-neon-cyan/50 text-muted-foreground"
+                          }`}
+                          style={{
+                            backgroundColor:
+                              preset.hex === "transparent" ? undefined : preset.hex,
+                            backgroundImage:
+                              preset.hex === "transparent"
+                                ? "linear-gradient(45deg,#666 25%,transparent 25%),linear-gradient(-45deg,#666 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#666 75%),linear-gradient(-45deg,transparent 75%,#666 75%)"
+                                : undefined,
+                            backgroundSize:
+                              preset.hex === "transparent" ? "8px 8px" : undefined,
+                          }}
+                          title={preset.label}
+                        >
+                          <span className="bg-black/40 px-1 rounded">
+                            {preset.label}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                    <div className="flex gap-2 items-center mt-1">
+                      <input
+                        type="color"
+                        value={
+                          bgRemoval.targetColor === "transparent"
+                            ? "#ffffff"
+                            : bgRemoval.targetColor
+                        }
+                        onChange={(e) =>
+                          setBgRemoval((p) => ({
+                            ...p,
+                            targetColor: e.target.value,
+                          }))
+                        }
+                        disabled={!bgRemoval.enabled || bgRemoval.targetColor === "transparent"}
+                        className="w-10 h-9 p-1 cursor-pointer rounded border border-border bg-transparent disabled:opacity-40"
+                      />
+                      <input
+                        type="text"
+                        value={bgRemoval.targetColor}
+                        onChange={(e) =>
+                          setBgRemoval((p) => ({
+                            ...p,
+                            targetColor: e.target.value,
+                          }))
+                        }
+                        disabled={!bgRemoval.enabled}
+                        className="flex-1 h-9 px-2 text-xs font-mono rounded border border-border bg-transparent disabled:opacity-40"
+                        placeholder="#ffffff"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Threshold & feather sliders */}
+                  <div className="space-y-2 border-t border-border/60 pt-3">
+                    <AdjustSlider
+                      label="Sensitivitas"
+                      icon={<Square className="h-3 w-3" />}
+                      value={bgRemoval.threshold}
+                      min={5}
+                      max={80}
+                      step={1}
+                      onChange={(v) =>
+                        setBgRemoval((p) => ({ ...p, threshold: v }))
+                      }
+                      disabled={!bgRemoval.enabled}
+                    />
+                    <AdjustSlider
+                      label="Feather Edge"
+                      value={bgRemoval.feather}
+                      min={0}
+                      max={100}
+                      step={1}
+                      onChange={(v) =>
+                        setBgRemoval((p) => ({ ...p, feather: v }))
+                      }
+                      disabled={!bgRemoval.enabled}
+                    />
+                  </div>
+
+                  {/* Flood fill toggle */}
+                  <div className="flex items-center justify-between gap-2 p-3 rounded-lg bg-secondary/30 border border-border/60">
+                    <div className="flex flex-col">
+                      <Label className="text-xs font-medium flex items-center gap-1">
+                        <Wand className="h-3 w-3 text-neon-cyan" /> Smart Fill
+                      </Label>
+                      <span className="text-[10px] text-muted-foreground">
+                        Hanya bg yang menyambung ke pojok (hindari baju ikut terhapus)
+                      </span>
+                    </div>
+                    <Switch
+                      checked={bgRemoval.floodFill}
+                      disabled={!bgRemoval.enabled}
+                      onCheckedChange={(v) =>
+                        setBgRemoval((p) => ({ ...p, floodFill: v }))
+                      }
+                    />
+                  </div>
+
+                  {!bgRemoval.enabled && (
+                    <p className="text-[10px] text-muted-foreground text-center">
+                      Aktifkan untuk hapus background otomatis atau ganti warna
+                      (cocok untuk pas foto: putih, merah, biru)
+                    </p>
+                  )}
+                  {bgRemoval.enabled && pickingSource && (
+                    <div className="p-2 rounded bg-neon-cyan/10 border border-neon-cyan/40 text-xs text-neon-cyan text-center animate-pulse">
+                      Klik di area background pada gambar untuk memilih warna sumber
+                    </div>
                   )}
                 </CardContent>
               </Card>
